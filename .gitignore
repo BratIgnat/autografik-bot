@@ -1,0 +1,26 @@
+﻿venv*/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Secrets
+.env
+*.key
+*.pem
+# Logs & tmp
+*.log
+logs/
+tmp/
+# Generated
+schedule.png
+*.png
+# Archives & dumps
+*.zip
+*.7z
+*.rar
+*.bak
+*.sql
