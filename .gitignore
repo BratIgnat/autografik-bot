@@ -24,3 +24,19 @@ schedule.png
 *.rar
 *.bak
 *.sql
+
+# venv
+.venv/
+venv*/
+
+# local env
+.env
+*.env
+
+# python
+__pycache__/
+*.pyc
+
+# artifacts
+*.png
+*.log

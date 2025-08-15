@@ -9,31 +9,79 @@ from datetime import datetime, timedelta
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from aiogram.types import FSInputFile
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import CallbackQuery
 from uuid import uuid4
 import matplotlib.pyplot as plt
 
+# ---------------- ENV & INIT ----------------
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_TOKEN (или BOT_TOKEN) не найден в .env")
+    raise SystemExit(1)
+print("TOKEN OK: ****" + TELEGRAM_TOKEN[-6:])
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("WARN: SUPABASE_URL/SUPABASE_KEY не заданы — проверь .env")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# ---------------- STATES ----------------
 class SlotState(StatesGroup):
     waiting_for_date = State()
     waiting_for_slot = State()
 
-# Новые состояния FSM для команд
 class JoinTeamState(StatesGroup):
     waiting_for_invite = State()
 
 class CreateTeamState(StatesGroup):
     waiting_for_team_name = State()
 
+# Админ-панель: недели и лимиты
+class AdminWeekState(StatesGroup):
+    waiting_for_monday = State()
+
+class AdminLimitsState(StatesGroup):
+    choosing_date = State()
+    choosing_scope = State()   # day|slot
+    choosing_slot = State()    # если scope=slot
+    choosing_role = State()
+    waiting_for_count = State()
+
+# Админ-панель: участники
+class AdminMembersState(StatesGroup):
+    browsing = State()
+    member_card = State()
+    changing_role = State()
+
+# ---------------- CONSTS & HELPERS ----------------
+ROLE_HEADERS = {'Официанты','Бармен','Хостес','Ранеры','Админы','Стажёры','Другие'}
+ROLE_CODES = [
+    ("Официанты", "employee"),
+    ("Хостес",     "host"),
+    ("Бармен",     "barman"),
+    ("Ранеры",     "runner"),
+    ("Админы",     "admin"),
+    ("Стажёры",    "trainee"),
+]
+STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-23:00", "17:00-23:00"]
+NO_SHIFT = {"-", "вых", "выходной"}  # значения, не считающиеся сменой
+PAGE_SIZE = 10
+
+def ensure_admin(user_row: dict) -> bool:
+    return bool(user_row and (user_row.get("is_admin") or user_row.get("is_owner")))
+
+def now_iso_z() -> str:
+    # UTC ISO8601 с Z — нормально пишется в timestamptz
+    return datetime.utcnow().isoformat() + "Z"
+
+# ---------------- KEYBOARDS ----------------
 def menu_keyboard():
     kb = [
         [KeyboardButton(text="📅 Расписание"), KeyboardButton(text="📝 Моя смена")],
@@ -49,6 +97,7 @@ def start_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+# ---------------- DATA HELPERS ----------------
 def get_active_week(team_id):
     week_resp = supabase.table("weeks").select("*").eq("team_id", team_id).eq("is_active", True).execute()
     if not week_resp.data:
@@ -69,7 +118,11 @@ def get_week_dates(start_date, end_date):
         })
     return dates
 
+# ---------------- SCHEDULE RENDER ----------------
 def make_schedule_image(users, week_days, shifts):
+    # Показываем только активных (если поля нет — считаем активным)
+    users = [u for u in users if u.get("is_active", True)]
+
     columns = ["ФИО"] + [f"{day['weekday']} {day['date']}" for day in week_days]
     role_map = {
         "employee": "Официанты",
@@ -81,7 +134,7 @@ def make_schedule_image(users, week_days, shifts):
     }
     roles_order = ["employee", "barman", "host", "runner", "admin", "trainee", "other"]
     data_rows = []
-    header_rows = []  # индексы строк-заголовков групп для стилизации
+    header_rows = []
 
     for role in roles_order:
         if role == "other":
@@ -114,46 +167,27 @@ def make_schedule_image(users, week_days, shifts):
     table.set_fontsize(13)
     table.auto_set_column_width(col=list(range(n_cols)))
 
-     # --- ПАТЧ НАЧИНАЕТСЯ ЗДЕСЬ ---
-    # Список ролей для подсветки
-    ROLE_HEADERS = {
-        'Официанты',
-        'Бармен',
-        'Хостес',
-        'Ранеры',
-        'Админы',
-        'Стажёры',
-        'Другие'
-    }
-
     for (row, col), cell in table.get_celld().items():
-        # 1) Шапка таблицы
         if row == 0:
             cell.set_fontsize(14)
             cell.set_text_props(weight="bold")
             cell.set_facecolor("#e3ebfa")
-
-        # 2) Если это первая колонка и значение — роль из списка
         elif col == 0 and row > 0 and data_rows[row - 1][0] in ROLE_HEADERS:
             cell.set_facecolor("#FFD580")
             cell.set_text_props(weight="bold", color="black")
-
-        # 3) Всё остальное — обычный текст и белый фон
         else:
             cell.set_facecolor("white")
             cell.set_text_props(weight="normal", color="black")
-    # --- ПАТЧ КОНЧАЕТСЯ ЗДЕСЬ ---
 
     plt.tight_layout()
     plt.savefig("schedule.png", bbox_inches='tight', transparent=True, dpi=170)
     plt.close(fig)
     return "schedule.png"
 
-
+# ---------------- COMMANDS ----------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    user = supabase.table("users").select("team_id").eq("telegram_id", message.from_user.id).execute().data
-    # Если пользователя вообще нет в базе — создать пустого пользователя (без команды)
+    user = supabase.table("users").select("*").eq("telegram_id", message.from_user.id).execute().data
     if not user:
         supabase.table("users").insert({
             "telegram_id": message.from_user.id,
@@ -161,22 +195,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "team_id": None,
             "is_owner": False,
             "is_admin": False,
-            "role": None
+            "role": None,
+            "is_active": True
         }).execute()
-        user = [{"team_id": None}]
-    if user and user[0].get("team_id"):
-        await message.answer(
-            "Добро пожаловать! Используй меню или команды для работы с ботом.",
-            reply_markup=menu_keyboard()
-        )
+        user = [{"team_id": None, "is_active": True}]
+
+    u = user[0]
+    if u.get("team_id"):
+        if not u.get("is_active", True):
+            await message.answer("Твой профиль в команде отключён. Обратись к администратору.")
+            return
+        await message.answer("Добро пожаловать! Используй меню или команды для работы с ботом.", reply_markup=menu_keyboard())
     else:
-        await message.answer(
-            "Ты не в команде! Создай команду или вступи по коду:",
-            reply_markup=start_keyboard()
-        )
-
-
-# Реализация новых пользователей
+        await message.answer("Ты не в команде! Создай команду или вступи по коду:", reply_markup=start_keyboard())
 
 @dp.message(F.text == "➕ Создать команду")
 async def btn_create_team(message: types.Message, state: FSMContext):
@@ -193,16 +224,14 @@ async def create_team_name(message: types.Message, state: FSMContext):
         "name": name,
         "invite_code": invite_code,
     }).execute()
-    # Создатель — owner/admin
     supabase.table('users').update({
         "team_id": team_id,
         "is_owner": True,
-        "is_admin": True
+        "is_admin": True,
+        "is_active": True
     }).eq('telegram_id', message.from_user.id).execute()
     await message.answer(
-        f"Команда <b>{name}</b> создана!\n"
-        f"Твой код для приглашения: <code>{invite_code}</code>\n"
-        "Ты назначен владельцем и администратором.",
+        f"Команда <b>{name}</b> создана!\nТвой код для приглашения: <code>{invite_code}</code>\nТы назначен владельцем и администратором.",
         parse_mode="HTML",
         reply_markup=menu_keyboard()
     )
@@ -224,7 +253,8 @@ async def join_team_code(message: types.Message, state: FSMContext):
     update_result = supabase.table('users').update({
         "team_id": team_id,
         "is_owner": False,
-        "is_admin": False
+        "is_admin": False,
+        "is_active": True
     }).eq('telegram_id', message.from_user.id).execute()
     if update_result.count == 0:
         supabase.table('users').insert({
@@ -233,7 +263,8 @@ async def join_team_code(message: types.Message, state: FSMContext):
             "team_id": team_id,
             "is_owner": False,
             "is_admin": False,
-            "role": None
+            "role": None,
+            "is_active": True
         }).execute()
     await message.answer(
         f"Ты успешно вступил в команду <b>{team[0]['name']}</b>!",
@@ -242,20 +273,23 @@ async def join_team_code(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
-
 @dp.message(F.text == "📅 Расписание")
 async def btn_schedule(message: types.Message, state: FSMContext):
-    user_resp = supabase.table("users").select("team_id").eq("telegram_id", message.from_user.id).execute()
+    user_resp = supabase.table("users").select("*").eq("telegram_id", message.from_user.id).execute()
     if not user_resp.data or not user_resp.data[0].get("team_id"):
         await message.answer("Ты не состоишь ни в одной команде.")
         return
+    if not user_resp.data[0].get("is_active", True):
+        await message.answer("Твой профиль в команде отключён. Обратись к администратору.")
+        return
+
     team_id = user_resp.data[0]["team_id"]
     week = get_active_week(team_id)
     if not week:
         await message.answer("Нет активной недели. Пусть владелец команды её создаст.")
         return
     week_days = get_week_dates(week["start_date"], week["end_date"])
-    users = supabase.table("users").select("id,name,role").eq("team_id", team_id).execute().data
+    users = supabase.table("users").select("id,name,role,is_active").eq("team_id", team_id).execute().data
     shifts = supabase.table("shifts").select("*").eq("team_id", team_id).execute().data
     img_path = make_schedule_image(users, week_days, shifts)
     photo = FSInputFile(img_path)
@@ -274,10 +308,14 @@ async def btn_invite(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "📝 Моя смена")
 async def myslot_start(message: types.Message, state: FSMContext):
-    user = supabase.table("users").select("team_id").eq("telegram_id", message.from_user.id).execute().data
+    user = supabase.table("users").select("*").eq("telegram_id", message.from_user.id).execute().data
     if not user or not user[0].get("team_id"):
         await message.answer("Ты не состоишь ни в одной команде.")
         return
+    if not user[0].get("is_active", True):
+        await message.answer("Твой профиль в команде отключён. Обратись к администратору.")
+        return
+
     team_id = user[0]["team_id"]
     week = get_active_week(team_id)
     if not week:
@@ -329,6 +367,7 @@ async def callback_choose_role(call: CallbackQuery, state: FSMContext):
             text=title,
             callback_data=f"setroleto_{code}"
         )
+    keyboard.adjust(2)
     await call.message.edit_text("Выберите новую роль для сотрудника:", reply_markup=keyboard.as_markup())
     await call.answer()
 
@@ -345,6 +384,7 @@ async def callback_set_role(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(f"Роль успешно обновлена!")
     await call.answer("Роль назначена.", show_alert=True)
 
+# ---------------- SLOT PICKING ----------------
 @dp.message(SlotState.waiting_for_date)
 async def slot_choose_day(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -371,32 +411,571 @@ async def slot_choose_day(message: types.Message, state: FSMContext):
 @dp.message(SlotState.waiting_for_slot)
 async def slot_choose_slot(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    slot = message.text
-    user = supabase.table("users").select("id,team_id,role").eq("telegram_id", message.from_user.id).execute().data[0]
-    date = data["selected_date"]
-    team_id = user["team_id"]
+    slot = (message.text or "").strip()
+
+    user = supabase.table("users").select("id,team_id,role,is_active").eq("telegram_id", message.from_user.id).execute().data[0]
+    if not user.get("is_active", True):
+        await message.answer("Твой профиль в команде отключён. Обратись к администратору.")
+        await state.clear()
+        return
+
     user_id = user["id"]
-    role = user["role"]
-    existing = supabase.table("shifts").select("id").eq("user_id", user_id).eq("date", date).eq("team_id", team_id).execute().data
+    team_id = user["team_id"]
+    role    = user["role"]
+    date    = data["selected_date"]  # YYYY-MM-DD
+
+    # Если пользователь выбирает "выходной" — пропускаем лимиты
+    if slot in NO_SHIFT:
+        existing = supabase.table("shifts").select("id").eq("user_id", user_id) \
+            .eq("date", date).eq("team_id", team_id).execute().data
+        if existing:
+            supabase.table("shifts").update({"slot": slot}).eq("id", existing[0]["id"]).execute()
+        else:
+            supabase.table("shifts").insert({
+                "user_id": user_id, "team_id": team_id, "date": date, "slot": slot
+            }).execute()
+        await message.answer(f"✅ Готово! Ты поставил {slot!r} на {date}.", reply_markup=menu_keyboard())
+        await btn_schedule(message, state)
+        await state.clear()
+        return
+
+    # --- 1) берём все лимиты на этот день и роль (и слот, и дневные) ---
+    lim_rows = supabase.table("limits").select("slot,max_count") \
+        .eq("team_id", team_id).eq("date", date).eq("role", role).execute().data
+
+    # Выбираем применимый лимит: приоритет точного слота, иначе дневной (slot NULL)
+    max_count = None
+    limit_is_daily = False
+    for r in lim_rows:
+        if r["slot"] == slot:
+            max_count = r["max_count"]
+            limit_is_daily = False
+            break
+    if max_count is None:
+        for r in lim_rows:
+            if r["slot"] is None:
+                max_count = r["max_count"]
+                limit_is_daily = True
+                break
+
+    # --- 2) если лимит задан — проверяем занятость ---
+    if max_count is not None:
+        if limit_is_daily:
+            taken_resp = supabase.table("shifts").select("user_id,slot") \
+                .eq("team_id", team_id).eq("date", date).execute().data
+            taken_ids = [r["user_id"] for r in taken_resp
+                         if r["user_id"] != user_id and (r["slot"] or "").strip() not in NO_SHIFT]
+        else:
+            taken_resp = supabase.table("shifts").select("user_id") \
+                .eq("team_id", team_id).eq("date", date).eq("slot", slot).execute().data
+            taken_ids = [r["user_id"] for r in taken_resp if r["user_id"] != user_id]
+
+        current_role_count = 0
+        if taken_ids:
+            roles_resp = supabase.table("users").select("id,role,is_active").in_("id", taken_ids).execute().data
+            current_role_count = sum(1 for u in roles_resp if u["role"] == role and u.get("is_active", True))
+
+        if current_role_count >= max_count:
+            await message.answer(
+                f"🚫 Лимит для роли «{role}» на {date} "
+                f"{'(на весь день)' if limit_is_daily else f'в слоте {slot}'} исчерпан: "
+                f"{current_role_count}/{max_count}. Выбери другой слот или день.",
+                reply_markup=menu_keyboard()
+            )
+            await state.clear()
+            return
+
+    existing = supabase.table("shifts").select("id") \
+        .eq("user_id", user_id).eq("date", date).eq("team_id", team_id).execute().data
     if existing:
         supabase.table("shifts").update({"slot": slot}).eq("id", existing[0]["id"]).execute()
     else:
         supabase.table("shifts").insert({
-            "user_id": user_id,
-            "team_id": team_id,
-            "date": date,
-            "slot": slot
+            "user_id": user_id, "team_id": team_id, "date": date, "slot": slot
         }).execute()
-    await message.answer(f"Готово! Ты выбрал смену {slot} на {date}.", reply_markup=menu_keyboard())
+
+    await message.answer(f"✅ Готово! Ты выбрал смену {slot} на {date}.", reply_markup=menu_keyboard())
     await btn_schedule(message, state)
     await state.clear()
 
+# ---------------- ADMIN PANEL ----------------
+@dp.message(Command("admin"))
+async def admin_entry(message: types.Message, state: FSMContext):
+    me = supabase.table("users").select("id,team_id,is_admin,is_owner").eq("telegram_id", message.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await message.answer("Доступ только для админов/владельцев.")
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📆 Активная неделя", callback_data="admin_week")
+    kb.button(text="📈 Лимиты (создать/изменить)", callback_data="admin_limits")
+    kb.button(text="👀 Лимиты недели (просмотр)", callback_data="admin_limits_view")
+    kb.button(text="🔁 Скопировать лимиты → след. неделя", callback_data="admin_limits_copy_next")
+    kb.button(text="👤 Участники", callback_data="admin_members")
+    kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
+    kb.adjust(1)
+    await message.answer("Админ-панель:", reply_markup=kb.as_markup())
+
+# --- Active Week flow ---
+@dp.callback_query(F.data == "admin_week")
+async def admin_week_start(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    await state.update_data(team_id=me[0]["team_id"])
+    txt = ("Введи дату ПОНЕДЕЛЬНИКА в формате YYYY-MM-DD.\n"
+           "Я поставлю конец недели = +6 дней и сделаю её активной.")
+    await call.message.edit_text(txt)
+    await state.set_state(AdminWeekState.waiting_for_monday)
+    await call.answer()
+
+@dp.message(AdminWeekState.waiting_for_monday)
+async def admin_week_set(message: types.Message, state: FSMContext):
+    try:
+        dt = datetime.strptime(message.text.strip(), "%Y-%m-%d").date()
+    except Exception:
+        await message.answer("Неверный формат. Пример: 2025-08-18"); return
+    monday = dt - timedelta(days=dt.weekday())
+    sunday = monday + timedelta(days=6)
+
+    data = await state.get_data()
+    team_id = data["team_id"]
+
+    supabase.table("weeks").update({"is_active": False}).eq("team_id", team_id).eq("is_active", True).execute()
+    supabase.table("weeks").insert({
+        "team_id": team_id,
+        "start_date": monday.isoformat(),
+        "end_date": sunday.isoformat(),
+        "is_active": True
+    }).execute()
+
+    await message.answer(f"✅ Неделя {monday} — {sunday} установлена активной.", reply_markup=menu_keyboard())
+    await state.clear()
+
+# --- Limits flow: создание/изменение ---
+@dp.callback_query(F.data == "admin_limits")
+async def admin_limits_start(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+
+    team_id = me[0]["team_id"]
+    week = get_active_week(team_id)
+    if not week:
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
+        await call.answer(); return
+
+    days = get_week_dates(week["start_date"], week["end_date"])
+    kb = InlineKeyboardBuilder()
+    for d in days:
+        kb.button(text=f"{d['weekday']} {d['date']}", callback_data=f"limit_date:{d['date_iso']}")
+    kb.adjust(3)
+    await state.update_data(team_id=team_id)
+    await call.message.edit_text("Выбери день для лимита:", reply_markup=kb.as_markup())
+    await state.set_state(AdminLimitsState.choosing_date)
+    await call.answer()
+
+@dp.callback_query(AdminLimitsState.choosing_date, F.data.startswith("limit_date:"))
+async def admin_limits_pick_date(call: CallbackQuery, state: FSMContext):
+    date_iso = call.data.split(":",1)[1]
+    await state.update_data(date=date_iso)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Лимит на ДЕНЬ", callback_data="limit_scope:day")
+    kb.button(text="Лимит на СЛОТ", callback_data="limit_scope:slot")
+    kb.adjust(1)
+    await call.message.edit_text(f"Дата: {date_iso}\nВыбери тип лимита:", reply_markup=kb.as_markup())
+    await state.set_state(AdminLimitsState.choosing_scope)
+    await call.answer()
+
+@dp.callback_query(AdminLimitsState.choosing_scope, F.data.startswith("limit_scope:"))
+async def admin_limits_pick_scope(call: CallbackQuery, state: FSMContext):
+    scope = call.data.split(":",1)[1]  # day|slot
+    await state.update_data(scope=scope)
+
+    if scope == "slot":
+        kb = InlineKeyboardBuilder()
+        for s in STD_SLOTS:
+            kb.button(text=s, callback_data=f"limit_slot:{s}")
+        kb.adjust(3)
+        await call.message.edit_text("Выбери слот:", reply_markup=kb.as_markup())
+        await state.set_state(AdminLimitsState.choosing_slot)
+    else:
+        kb = InlineKeyboardBuilder()
+        for title, code in ROLE_CODES:
+            kb.button(text=title, callback_data=f"limit_role:{code}")
+        kb.adjust(2)
+        await call.message.edit_text("Выбери роль:", reply_markup=kb.as_markup())
+        await state.set_state(AdminLimitsState.choosing_role)
+    await call.answer()
+
+@dp.callback_query(AdminLimitsState.choosing_slot, F.data.startswith("limit_slot:"))
+async def admin_limits_pick_slot(call: CallbackQuery, state: FSMContext):
+    slot = call.data.split(":",1)[1]
+    await state.update_data(slot=slot)
+    kb = InlineKeyboardBuilder()
+    for title, code in ROLE_CODES:
+        kb.button(text=title, callback_data=f"limit_role:{code}")
+    kb.adjust(2)
+    await call.message.edit_text(f"Слот: {slot}\nТеперь выбери роль:", reply_markup=kb.as_markup())
+    await state.set_state(AdminLimitsState.choosing_role)
+    await call.answer()
+
+@dp.callback_query(AdminLimitsState.choosing_role, F.data.startswith("limit_role:"))
+async def admin_limits_pick_role(call: CallbackQuery, state: FSMContext):
+    role = call.data.split(":",1)[1]
+    await state.update_data(role=role)
+    await call.message.edit_text("Введи максимальное количество (целое число ≥ 0):")
+    await state.set_state(AdminLimitsState.waiting_for_count)
+    await call.answer()
+
+@dp.message(AdminLimitsState.waiting_for_count)
+async def admin_limits_set_count(message: types.Message, state: FSMContext):
+    try:
+        n = int(message.text.strip())
+        if n < 0:
+            raise ValueError
+    except Exception:
+        await message.answer("Нужно целое число ≥ 0. Введи ещё раз:"); return
+
+    data = await state.get_data()
+    team_id = data["team_id"]; date_iso = data["date"]
+    role = data["role"]; scope = data.get("scope","day"); slot = data.get("slot")
+
+    if scope == "day":
+        exist = supabase.table("limits").select("id").eq("team_id", team_id).eq("date", date_iso)\
+                 .is_("slot", None).eq("role", role).execute().data
+        if exist:
+            supabase.table("limits").update({"max_count": n}).eq("id", exist[0]["id"]).execute()
+        else:
+            supabase.table("limits").insert({"team_id": team_id, "date": date_iso, "slot": None, "role": role, "max_count": n}).execute()
+        msg = f"✅ Лимит на день {date_iso} для роли «{role}»: {n}"
+    else:
+        exist = supabase.table("limits").select("id").eq("team_id", team_id).eq("date", date_iso)\
+                 .eq("slot", slot).eq("role", role).execute().data
+        if exist:
+            supabase.table("limits").update({"max_count": n}).eq("id", exist[0]["id"]).execute()
+        else:
+            supabase.table("limits").insert({"team_id": team_id, "date": date_iso, "slot": slot, "role": role, "max_count": n}).execute()
+        msg = f"✅ Лимит на {date_iso} слот {slot} для роли «{role}»: {n}"
+
+    await message.answer(msg, reply_markup=menu_keyboard())
+    await state.clear()
+
+# --- Limits view ---
+@dp.callback_query(F.data == "admin_limits_view")
+async def admin_limits_view(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    team_id = me[0]["team_id"]
+
+    week = get_active_week(team_id)
+    if not week:
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
+        await call.answer(); return
+
+    days = get_week_dates(week["start_date"], week["end_date"])
+
+    def fmt_one_day_limits(day_iso: str) -> str:
+        rows = supabase.table("limits").select("slot,role,max_count").eq("team_id", team_id).eq("date", day_iso).execute().data
+        if not rows:
+            return "—"
+        by_role = {}
+        for r in rows:
+            role = r.get("role") or "—"
+            by_role.setdefault(role, {"day": None, "slots": {}})
+            if r["slot"] is None:
+                by_role[role]["day"] = r["max_count"]
+            else:
+                by_role[role]["slots"][r["slot"]] = r["max_count"]
+        parts = []
+        for role in sorted(by_role.keys()):
+            rec = by_role[role]
+            chunk = f"{role}: "
+            sub = []
+            if rec["day"] is not None:
+                sub.append(f"день={rec['day']}")
+            if rec["slots"]:
+                slot_str = ", ".join(f"{s}={cnt}" for s, cnt in sorted(rec["slots"].items()))
+                sub.append(slot_str)
+            chunk += "; ".join(sub) if sub else "—"
+            parts.append(chunk)
+        return " | ".join(parts)
+
+    header = f"📊 Лимиты на неделю {week['start_date']} — {week['end_date']}\n"
+    msg = header
+    sent_any = False
+    for d in days:
+        line = f"{d['weekday']} {d['date']}: {fmt_one_day_limits(d['date_iso'])}\n"
+        if len(msg) + len(line) > 3500:
+            await call.message.answer(msg)
+            msg = ""
+            sent_any = True
+        msg += line
+
+    if msg:
+        if sent_any:
+            await call.message.answer(msg)
+        else:
+            await call.message.edit_text(msg)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад в админ-меню", callback_data="admin_back")
+    await call.message.answer("Готово.", reply_markup=kb.as_markup())
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("id,team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📆 Активная неделя", callback_data="admin_week")
+    kb.button(text="📈 Лимиты (создать/изменить)", callback_data="admin_limits")
+    kb.button(text="👀 Лимиты недели (просмотр)", callback_data="admin_limits_view")
+    kb.button(text="🔁 Скопировать лимиты → след. неделя", callback_data="admin_limits_copy_next")
+    kb.button(text="👤 Участники", callback_data="admin_members")
+    kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
+    kb.adjust(1)
+    await call.message.edit_text("Админ-панель:", reply_markup=kb.as_markup())
+    await call.answer()
+
+# --- Limits copy to next week ---
+@dp.callback_query(F.data == "admin_limits_copy_next")
+async def admin_limits_copy_next(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    team_id = me[0]["team_id"]
+
+    week = get_active_week(team_id)
+    if not week:
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
+        await call.answer(); return
+
+    start = datetime.strptime(week["start_date"], "%Y-%m-%d").date()
+    end   = datetime.strptime(week["end_date"], "%Y-%m-%d").date()
+
+    rows = supabase.table("limits").select("date,slot,role,max_count") \
+        .eq("team_id", team_id).gte("date", start.isoformat()).lte("date", end.isoformat()).execute().data
+
+    if not rows:
+        await call.message.edit_text("На активной неделе нет лимитов для копирования.")
+        await call.answer(); return
+
+    inserted = 0
+    updated = 0
+    for r in rows:
+        src_date = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        dst_date = (src_date + timedelta(days=7)).isoformat()
+        role = r["role"]
+        slot = r["slot"]  # может быть None
+        max_count = r["max_count"]
+
+        q = supabase.table("limits").select("id").eq("team_id", team_id).eq("date", dst_date).eq("role", role)
+        if slot is None:
+            q = q.is_("slot", None)
+        else:
+            q = q.eq("slot", slot)
+        exist = q.execute().data
+
+        if exist:
+            supabase.table("limits").update({"max_count": max_count}).eq("id", exist[0]["id"]).execute()
+            updated += 1
+        else:
+            supabase.table("limits").insert({
+                "team_id": team_id, "date": dst_date, "slot": slot, "role": role, "max_count": max_count
+            }).execute()
+            inserted += 1
+
+    await call.message.edit_text(
+        f"✅ Скопировано лимитов на следующую неделю: добавлено {inserted}, обновлено {updated}."
+    )
+    await call.answer()
+
+# --- Reset invite code ---
+@dp.callback_query(F.data == "admin_reset_invite")
+async def admin_reset_invite(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    team_id = me[0]["team_id"]
+    new_code = str(uuid4()).split("-")[0].upper()
+    supabase.table("teams").update({"invite_code": new_code}).eq("id", team_id).execute()
+    await call.message.edit_text(f"♻️ Новый инвайт-код: <code>{new_code}</code>", parse_mode="HTML")
+    await call.answer()
+
+# --- Members: list / card / actions ---
+def _member_badges(u: dict) -> str:
+    badges = []
+    if u.get("is_owner"): badges.append("👑")
+    elif u.get("is_admin"): badges.append("🛡️")
+    badges.append("🟢" if u.get("is_active", True) else "🔴")
+    return "".join(badges)
+
+def _paginate(items, page, size):
+    total = len(items)
+    start = page * size
+    end = start + size
+    return items[start:end], total
+
+@dp.callback_query(F.data == "admin_members")
+async def admin_members_start(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+    team_id = me[0]["team_id"]
+
+    members = supabase.table("users").select("id,name,role,is_admin,is_owner,is_active") \
+        .eq("team_id", team_id).order("name").execute().data
+
+    await state.update_data(members_cache=members)  # кэш на время просмотра
+    await _render_members_page(call.message, members, page=0)
+    await state.set_state(AdminMembersState.browsing)
+    await call.answer()
+
+async def _render_members_page(msg: types.Message, members: list, page: int):
+    page_items, total = _paginate(members, page, PAGE_SIZE)
+    kb = InlineKeyboardBuilder()
+    for u in page_items:
+        label = f"{_member_badges(u)} {u['name']} ({u.get('role') or '—'})"
+        kb.button(text=label[:64], callback_data=f"member_open:{u['id']}")
+    # навигация
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️ Назад", callback_data=f"members_page:{page-1}")
+    if (page + 1) * PAGE_SIZE < total:
+        nav.button(text="Вперёд ➡️", callback_data=f"members_page:{page+1}")
+    nav.adjust(2)
+    kb.adjust(1)
+    text = f"👤 Участники (стр. {page+1})"
+    await msg.edit_text(text, reply_markup=kb.as_markup())
+    if nav.buttons:
+        await msg.answer("Навигация:", reply_markup=nav.as_markup())
+    else:
+        # чтобы не плодить лишних сообщений
+        pass
+
+@dp.callback_query(AdminMembersState.browsing, F.data.startswith("members_page:"))
+async def members_page_nav(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[1])
+    data = await state.get_data()
+    members = data.get("members_cache", [])
+    await _render_members_page(call.message, members, page)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("member_open:"))
+async def member_open(call: CallbackQuery, state: FSMContext):
+    member_id = call.data.split(":")[1]
+    me = supabase.table("users").select("team_id,is_admin,is_owner,id").eq("telegram_id", call.from_user.id).execute().data[0]
+    if not ensure_admin(me):
+        await call.answer("Нет доступа", show_alert=True); return
+    team_id = me["team_id"]
+
+    rows = supabase.table("users").select("id,name,role,is_admin,is_owner,is_active,telegram_id") \
+        .eq("id", member_id).eq("team_id", team_id).execute().data
+    if not rows:
+        await call.answer("Пользователь не найден.", show_alert=True); return
+    u = rows[0]
+
+    text = (
+        f"{_member_badges(u)} <b>{u['name']}</b>\n"
+        f"Роль: <code>{u.get('role') or '—'}</code>\n"
+        f"Статус: {'Активен' if u.get('is_active', True) else 'Отключён'}\n"
+        f"Права: {'Владелец' if u.get('is_owner') else ('Админ' if u.get('is_admin') else 'Сотрудник')}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    # смена роли
+    for title, code in ROLE_CODES:
+        kb.button(text=title, callback_data=f"member_setrole:{u['id']}:{code}")
+    kb.adjust(3)
+
+    actions = InlineKeyboardBuilder()
+    # нельзя понижать владельца по кнопке "админ"
+    if not u.get("is_owner"):
+        actions.button(
+            text=("Снять админа" if u.get("is_admin") else "Сделать админом"),
+            callback_data=f"member_admin_toggle:{u['id']}"
+        )
+    actions.button(
+        text=("Отключить" if u.get("is_active", True) else "Восстановить"),
+        callback_data=f"member_toggle_active:{u['id']}"
+    )
+    if me["id"] != u["id"]:
+        actions.button(text="Удалить из команды", callback_data=f"member_remove:{u['id']}")
+    actions.button(text="↩️ К списку", callback_data="admin_members")
+    actions.adjust(2)
+
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
+    await call.message.answer("Действия:", reply_markup=actions.as_markup())
+    await state.set_state(AdminMembersState.member_card)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("member_setrole:"))
+async def member_setrole(call: CallbackQuery, state: FSMContext):
+    _, user_id, role = call.data.split(":")
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data[0]
+    if not ensure_admin(me):
+        await call.answer("Нет доступа", show_alert=True); return
+    supabase.table("users").update({"role": role}).eq("id", user_id).eq("team_id", me["team_id"]).execute()
+    await call.answer("Роль обновлена")
+    # перерисуем карточку
+    await member_open(call, state)
+
+@dp.callback_query(F.data.startswith("member_admin_toggle:"))
+async def member_admin_toggle(call: CallbackQuery, state: FSMContext):
+    user_id = call.data.split(":")[1]
+    me = supabase.table("users").select("team_id,is_admin,is_owner,id").eq("telegram_id", call.from_user.id).execute().data[0]
+    if not ensure_admin(me):
+        await call.answer("Нет доступа", show_alert=True); return
+    rows = supabase.table("users").select("is_admin,is_owner").eq("id", user_id).eq("team_id", me["team_id"]).execute().data
+    if not rows:
+        await call.answer("Не найдено", show_alert=True); return
+    u = rows[0]
+    if u.get("is_owner"):
+        await call.answer("Нельзя изменять права владельца.", show_alert=True); return
+    supabase.table("users").update({"is_admin": not u.get("is_admin", False)}).eq("id", user_id).execute()
+    await call.answer("Готово")
+    await member_open(call, state)
+
+@dp.callback_query(F.data.startswith("member_toggle_active:"))
+async def member_toggle_active(call: CallbackQuery, state: FSMContext):
+    user_id = call.data.split(":")[1]
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data[0]
+    if not ensure_admin(me):
+        await call.answer("Нет доступа", show_alert=True); return
+    rows = supabase.table("users").select("is_active").eq("id", user_id).eq("team_id", me["team_id"]).execute().data
+    if not rows:
+        await call.answer("Не найдено", show_alert=True); return
+    curr = rows[0].get("is_active", True)
+    if curr:
+        supabase.table("users").update({"is_active": False, "left_at": now_iso_z(), "is_admin": False}).eq("id", user_id).execute()
+    else:
+        supabase.table("users").update({"is_active": True, "left_at": None}).eq("id", user_id).execute()
+    await call.answer("Статус изменён")
+    await member_open(call, state)
+
+@dp.callback_query(F.data.startswith("member_remove:"))
+async def member_remove(call: CallbackQuery, state: FSMContext):
+    user_id = call.data.split(":")[1]
+    me = supabase.table("users").select("team_id,is_admin,is_owner,id").eq("telegram_id", call.from_user.id).execute().data[0]
+    if not ensure_admin(me):
+        await call.answer("Нет доступа", show_alert=True); return
+    if me["id"] == user_id:
+        await call.answer("Нельзя удалить самого себя.", show_alert=True); return
+    # Жёсткое удаление из команды: team_id=null, снимаем админа и деактивируем
+    supabase.table("users").update({"team_id": None, "is_admin": False, "is_active": False}).eq("id", user_id).eq("team_id", me["team_id"]).execute()
+    await call.answer("Пользователь удалён из команды")
+    await admin_members_start(call, state)
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    import asyncio
-    import logging
+    import asyncio, logging, sys
     logging.basicConfig(level=logging.INFO)
-    print("Бот стартовал, polling запущен!")
-    import sys
+    print("Бот стартует... запускаю polling")
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    dp.run_polling(bot)
+    try:
+        dp.run_polling(bot)
+    finally:
+        print("Polling завершён")
