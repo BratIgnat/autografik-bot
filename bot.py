@@ -743,7 +743,7 @@ async def admin_limits_view(call: CallbackQuery, state: FSMContext):
             sub = []
             if rec["day"] is not None:
                 sub.append(f"день={rec['day']}")
-            if rec["slots"]]:
+            if rec["slots"]:
                 slot_str = ", ".join(f"{s}={cnt}" for s, cnt in sorted(rec["slots"].items()))
                 sub.append(slot_str)
             chunk += "; ".join(sub) if sub else "—"
