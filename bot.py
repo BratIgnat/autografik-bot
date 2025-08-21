@@ -69,7 +69,7 @@ ROLE_CODES = [
     ("Админы",     "admin"),
     ("Стажёры",    "trainee"),
 ]
-STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-23:00", "17:00-23:00"]
+STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-23:00", "17:00-23:00", "хост", "бар"]
 NO_SHIFT = {"-", "вых", "выходной"}  # значения, не считающиеся сменой
 PAGE_SIZE = 10
 
@@ -439,6 +439,8 @@ async def slot_choose_day(message: types.Message, state: FSMContext):
         KeyboardButton(text="13:00-23:00"),
         KeyboardButton(text="вых"),
         KeyboardButton(text="17:00-23:00"),
+        KeyboardButton(text="хост"),
+        KeyboardButton(text="бар")
     ]
     kb = [[s] for s in slots]
     kb.append([KeyboardButton(text="❌ Отмена")])    # ← cancel (reply)
