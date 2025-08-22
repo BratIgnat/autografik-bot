@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 from uuid import uuid4
+import io
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -21,6 +22,11 @@ from supabase import create_client, Client
 import matplotlib
 matplotlib.use("Agg")            # важно для ВМ
 import matplotlib.pyplot as plt  # после выбора бэкенда
+
+# --- openpyxl для экспорта в Excel ---
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # ---------------- ENV & INIT ----------------
 load_dotenv()
@@ -83,18 +89,28 @@ STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-
 NO_SHIFT = {"-", "вых", "выходной"}  # значения, не считающиеся сменой
 PAGE_SIZE = 10
 
+# Цвета и стиль Excel
+XL_GROUP_FILL = "FFA500"   # оранжевый для шапок подгрупп
+XL_HEADER_FILL = "EFEFEF"  # серый для заголовков таблиц
+XL_WEEKEND_FILL = "FFF2CC" # мяглый фон для сб/вс
+XL_BORDER = Side(style="thin", color="DDDDDD")
+
+
 def ensure_admin(user_row: dict) -> bool:
     return bool(user_row and (user_row.get("is_admin") or user_row.get("is_owner")))
+
 
 def now_iso_z() -> str:
     # UTC ISO8601 с Z — нормально пишется в timestamptz
     return datetime.utcnow().isoformat() + "Z"
+
 
 def is_cancel(text: str) -> bool:
     """Возвращает True, если сообщение похоже на 'Отмена' (с эмодзи/пробелами/регистром)."""
     return bool(text) and ("отмена" in text.casefold())
 
 # ---------------- KEYBOARDS ----------------
+
 def menu_keyboard():
     kb = [
         [KeyboardButton(text="📅 Расписание"), KeyboardButton(text="📝 Моя смена")],
@@ -103,12 +119,14 @@ def menu_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+
 def start_keyboard():
     kb = [
         [KeyboardButton(text="➕ Создать команду")],
         [KeyboardButton(text="🔑 Вступить по коду")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
 
 def cancel_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -117,11 +135,13 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     )
 
 # ---------------- DATA HELPERS ----------------
+
 def get_active_week(team_id):
     week_resp = supabase.table("weeks").select("*").eq("team_id", team_id).eq("is_active", True).execute()
     if not week_resp.data:
         return None
     return week_resp.data[0]
+
 
 def get_week_dates(start_date, end_date):
     wdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -137,7 +157,8 @@ def get_week_dates(start_date, end_date):
         })
     return dates
 
-# ---------------- SCHEDULE RENDER ----------------
+# ---------------- SCHEDULE RENDER (IMAGE) ----------------
+
 def make_schedule_image(users, week_days, shifts):
     # Показываем только активных (если поля нет — считаем активным)
     users = [u for u in users if u.get("is_active", True)]
@@ -203,7 +224,194 @@ def make_schedule_image(users, week_days, shifts):
     plt.close(fig)
     return "schedule.png"
 
+# ---------------- EXCEL EXPORT ----------------
+
+ROLE_TITLE_BY_CODE = {
+    "employee": "Официанты",
+    "host": "Хостес",
+    "barman": "Бармен",
+    "runner": "Ранеры",
+    "admin": "Админы",
+    "trainee": "Стажёры",
+}
+
+ROLES_EXPORT_ORDER = ["employee", "host", "barman", "runner", "admin", "trainee", "other"]
+
+
+def _xl_apply_table_styles(ws, start_row: int, end_row: int, start_col: int, end_col: int, weekend_cols: list[int]):
+    # границы + выравнивание
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+            cell.border = Border(top=XL_BORDER, bottom=XL_BORDER, left=XL_BORDER, right=XL_BORDER)
+
+    # подсветка выходных в содержимом (не шапке)
+    for c in weekend_cols:
+        for r in range(start_row + 1, end_row + 1):
+            ws.cell(row=r, column=c).fill = PatternFill("solid", fgColor=XL_WEEKEND_FILL)
+
+
+def _xl_auto_width(ws):
+    for col in range(1, ws.max_column + 1):
+        max_len = 0
+        for row in range(1, ws.max_row + 1):
+            v = ws.cell(row=row, column=col).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[get_column_letter(col)].width = min(max(12, max_len + 2), 38)
+
+
+def export_schedule_excel_for_team(team_id: str):
+    """
+    Возвращает (filename: str, bytes_io: io.BytesIO) с Excel-графиком активной недели.
+    Ничего не меняет в БД. Предполагает, что неделя уже активна.
+    """
+    week = get_active_week(team_id)
+    if not week:
+        raise RuntimeError("Нет активной недели")
+
+    week_days = get_week_dates(week["start_date"], week["end_date"])  # список из 7 dict
+
+    # Пользователи (только активные)
+    users = supabase.table("users").select("id,name,role,is_active").eq("team_id", team_id).order("name").execute().data
+    users = [u for u in users if u.get("is_active", True)]
+
+    # Смены только в диапазоне недели
+    start_iso = week_days[0]["date_iso"]
+    end_iso = week_days[-1]["date_iso"]
+    shifts = supabase.table("shifts").select("user_id,date,slot").eq("team_id", team_id) \
+        .gte("date", start_iso).lte("date", end_iso).execute().data
+    shift_map = {(s["user_id"], s["date"]): (s.get("slot") or "") for s in shifts}
+
+    # Лимиты недели (для сводки наверху)
+    limits = supabase.table("limits").select("date,slot,role,max_count").eq("team_id", team_id) \
+        .gte("date", start_iso).lte("date", end_iso).execute().data
+
+    # Построение Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "График"
+
+    # Заголовок
+    title = f"График на неделю: {week['start_date']} — {week['end_date']}"
+    ws.append([title])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=1 + len(week_days))
+    ws.cell(row=1, column=1).font = Font(bold=True)
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal="left", vertical="center")
+
+    cur_row = 3  # отступ после заголовка
+
+    # Сводка лимитов
+    ws.cell(row=cur_row, column=1, value="День")
+    ws.cell(row=cur_row, column=2, value="Роль")
+    ws.cell(row=cur_row, column=3, value="Лимит")
+    for c in range(1, 4):
+        cell = ws.cell(row=cur_row, column=c)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=XL_HEADER_FILL)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    cur_row += 1
+
+    # агрегируем лимиты по датам
+    day_limits = {}
+    for li in limits:
+        day_limits.setdefault(li["date"], []).append(li)
+
+    if not day_limits:
+        ws.append(["—", "—", "—"])
+        cur_row += 1
+    else:
+        # идём по дням недели по порядку
+        for d in week_days:
+            daily = day_limits.get(d["date_iso"], [])
+            if not daily:
+                ws.append([f"{d['weekday']} {d['date']}", "—", "—"])
+                cur_row += 1
+                continue
+            for li in sorted(daily, key=lambda x: (x.get("role") or "", x.get("slot") or "")):
+                role = li.get("role") or "—"
+                lim = li.get("max_count")
+                ws.append([f"{d['weekday']} {d['date']}", role, lim])
+                cur_row += 1
+
+    cur_row += 2  # отступ перед блоками по ролям
+
+    # Заголовки колонок для табличной части
+    col_labels = ["Сотрудник"] + [d["date"] for d in week_days]
+
+    # Определим индексы колонок выходных (Сб/Вс)
+    weekend_cols = []
+    for idx, d in enumerate(week_days, start=2):  # начинаем с 2, т.к. 1-й столбец — ФИО
+        if d["weekday"] in ("Сб", "Вс"):
+            weekend_cols.append(idx)
+
+    # Группировка пользователей по ролям
+    users_by_role: dict[str, list[dict]] = {}
+    for u in users:
+        code = (u.get("role") or "").strip()
+        if code not in ROLE_TITLE_BY_CODE:
+            code = "other"
+        users_by_role.setdefault(code, []).append(u)
+
+    # Сортировка по имени внутри ролей
+    for lst in users_by_role.values():
+        lst.sort(key=lambda x: (x.get("name") or "").lower())
+
+    # Рендер блоков по ролям
+    for role_code in ROLES_EXPORT_ORDER:
+        role_users = users_by_role.get(role_code, [])
+        if not role_users:
+            continue
+
+        # Строка-заголовок подгруппы (оранжевая)
+        ws.insert_rows(cur_row, 1)
+        ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=len(col_labels))
+        gcell = ws.cell(row=cur_row, column=1)
+        gcell.value = ROLE_TITLE_BY_CODE.get(role_code, "Другие")
+        gcell.font = Font(bold=True)
+        gcell.alignment = Alignment(horizontal="left", vertical="center")
+        gcell.fill = PatternFill("solid", fgColor=XL_GROUP_FILL)
+        cur_row += 1
+
+        # Шапка таблицы
+        for c, label in enumerate(col_labels, start=1):
+            cell = ws.cell(row=cur_row, column=c, value=label)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor=XL_HEADER_FILL)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        header_row = cur_row
+        cur_row += 1
+
+        # Строки сотрудников
+        start_table_row = header_row
+        for u in role_users:
+            ws.cell(row=cur_row, column=1, value=u["name"])  # ФИО — оставляем чёрным для печати
+            # ячейки на 7 дней
+            for idx, d in enumerate(week_days, start=2):
+                slot = shift_map.get((u["id"], d["date_iso"]), "")
+                ws.cell(row=cur_row, column=idx, value=slot)
+            cur_row += 1
+        end_table_row = cur_row - 1
+
+        # Стили сетки и выходных
+        _xl_apply_table_styles(ws, start_table_row, end_table_row, 1, len(col_labels), weekend_cols)
+
+        cur_row += 2  # отступ перед следующей подгруппой
+
+    # Автоширина
+    _xl_auto_width(ws)
+
+    # Сохранение в BytesIO
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    filename = f"grafik_{week['start_date']}_{week['end_date']}.xlsx"
+    return filename, bio
+
 # ---------------- COMMANDS ----------------
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user = supabase.table("users").select("*").eq("telegram_id", message.from_user.id).execute().data
@@ -228,10 +436,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await message.answer("Ты не в команде! Создай команду или вступи по коду:", reply_markup=start_keyboard())
 
+
 @dp.message(F.text == "➕ Создать команду")
 async def btn_create_team(message: types.Message, state: FSMContext):
     await message.answer("Введи название для своей команды (одной строкой):", reply_markup=cancel_kb())
     await state.set_state(CreateTeamState.waiting_for_team_name)
+
 
 @dp.message(CreateTeamState.waiting_for_team_name)
 async def create_team_name(message: types.Message, state: FSMContext):
@@ -261,10 +471,12 @@ async def create_team_name(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+
 @dp.message(F.text == "🔑 Вступить по коду")
 async def btn_join_team(message: types.Message, state: FSMContext):
     await message.answer("Введи код приглашения (invite_code) команды:", reply_markup=cancel_kb())
     await state.set_state(JoinTeamState.waiting_for_invite)
+
 
 @dp.message(JoinTeamState.waiting_for_invite)
 async def join_team_code(message: types.Message, state: FSMContext):
@@ -302,6 +514,7 @@ async def join_team_code(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+
 @dp.message(F.text == "📅 Расписание")
 async def btn_schedule(message: types.Message, state: FSMContext):
     user_resp = supabase.table("users").select("*").eq("telegram_id", message.from_user.id).execute()
@@ -324,6 +537,7 @@ async def btn_schedule(message: types.Message, state: FSMContext):
     photo = FSInputFile(img_path)
     await message.answer_photo(photo, caption="Текущее расписание:", reply_markup=menu_keyboard())
 
+
 @dp.message(F.text == "👥 Пригласить сотрудника")
 async def btn_invite(message: types.Message, state: FSMContext):
     user = supabase.table("users").select("team_id").eq("telegram_id", message.from_user.id).execute().data
@@ -334,6 +548,7 @@ async def btn_invite(message: types.Message, state: FSMContext):
     team = supabase.table("teams").select("invite_code").eq("id", team_id).execute().data
     invite_code = team[0]["invite_code"] if team and team[0].get("invite_code") else "Нет кода"
     await message.answer(f"Код приглашения для вашей команды: <code>{invite_code}</code>", parse_mode="HTML")
+
 
 @dp.message(F.text == "📝 Моя смена")
 async def myslot_start(message: types.Message, state: FSMContext):
@@ -359,6 +574,7 @@ async def myslot_start(message: types.Message, state: FSMContext):
     await state.set_state(SlotState.waiting_for_date)
     await state.update_data(week_days=week_days, team_id=team_id)
 
+
 @dp.message(F.text == "👤 Выдать роль")
 async def btn_give_role(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -380,6 +596,7 @@ async def btn_give_role(message: types.Message, state: FSMContext):
             callback_data=f"setrole_{member['id']}"
         )
     await message.answer("Выберите сотрудника для назначения роли:", reply_markup=keyboard.as_markup())
+
 
 @dp.callback_query(F.data.startswith("setrole_"))
 async def callback_choose_role(call: CallbackQuery, state: FSMContext):
@@ -403,6 +620,7 @@ async def callback_choose_role(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("Выберите новую роль для сотрудника:", reply_markup=keyboard.as_markup())
     await call.answer()
 
+
 @dp.callback_query(F.data.startswith("setroleto_"))
 async def callback_set_role(call: CallbackQuery, state: FSMContext):
     role_code = call.data.replace("setroleto_", "")
@@ -417,6 +635,7 @@ async def callback_set_role(call: CallbackQuery, state: FSMContext):
     await call.answer("Роль назначена.", show_alert=True)
 
 # ---------------- SLOT PICKING ----------------
+
 @dp.message(SlotState.waiting_for_date)
 async def slot_choose_day(message: types.Message, state: FSMContext):
     # ранняя отмена
@@ -435,11 +654,11 @@ async def slot_choose_day(message: types.Message, state: FSMContext):
         return
 
     # клавиатура слотов + отмена
-    slots = [KeyboardButton(text=s) for s in STD_SLOTS] + [KeyboardButton(text="вых")]
     kb_rows = [[KeyboardButton(text=s)] for s in STD_SLOTS] + [[KeyboardButton(text="вых")], [KeyboardButton(text="❌ Отмена")]]
     await state.update_data(selected_date=day["date_iso"])
     await message.answer("Выбери смену:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_rows, resize_keyboard=True))
     await state.set_state(SlotState.waiting_for_slot)
+
 
 @dp.message(SlotState.waiting_for_slot)
 async def slot_choose_slot(message: types.Message, state: FSMContext):
@@ -538,6 +757,7 @@ async def slot_choose_slot(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ---------------- ADMIN PANEL ----------------
+
 @dp.message(Command("admin"))
 async def admin_entry(message: types.Message, state: FSMContext):
     me = supabase.table("users").select("id,team_id,is_admin,is_owner").eq("telegram_id", message.from_user.id).execute().data
@@ -549,10 +769,12 @@ async def admin_entry(message: types.Message, state: FSMContext):
     kb.button(text="📈 Лимиты (создать/изменить)", callback_data="admin_limits")
     kb.button(text="👀 Лимиты недели (просмотр)", callback_data="admin_limits_view")
     kb.button(text="🔁 Скопировать лимиты → след. неделя", callback_data="admin_limits_copy_next")
+    kb.button(text="📥 Скачать Excel", callback_data="admin_download_excel")
     kb.button(text="👤 Участники", callback_data="admin_members")
     kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
     kb.adjust(1)
     await message.answer("Админ-панель:", reply_markup=kb.as_markup())
+
 
 # --- Active Week flow ---
 @dp.callback_query(F.data == "admin_week")
@@ -568,6 +790,7 @@ async def admin_week_start(call: CallbackQuery, state: FSMContext):
     await call.message.answer("Можно отменить ввод:", reply_markup=cancel_kb())
     await state.set_state(AdminWeekState.waiting_for_monday)
     await call.answer()
+
 
 @dp.message(AdminWeekState.waiting_for_monday)
 async def admin_week_set(message: types.Message, state: FSMContext):
@@ -597,6 +820,7 @@ async def admin_week_set(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Неделя {monday} — {sunday} установлена активной.", reply_markup=menu_keyboard())
     await state.clear()
 
+
 # --- Limits flow: создание/изменение ---
 @dp.callback_query(F.data == "admin_limits")
 async def admin_limits_start(call: CallbackQuery, state: FSMContext):
@@ -620,6 +844,7 @@ async def admin_limits_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminLimitsState.choosing_date)
     await call.answer()
 
+
 @dp.callback_query(AdminLimitsState.choosing_date, F.data.startswith("limit_date:"))
 async def admin_limits_pick_date(call: CallbackQuery, state: FSMContext):
     date_iso = call.data.split(":",1)[1]
@@ -631,6 +856,7 @@ async def admin_limits_pick_date(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(f"Дата: {date_iso}\nВыбери тип лимита:", reply_markup=kb.as_markup())
     await state.set_state(AdminLimitsState.choosing_scope)
     await call.answer()
+
 
 @dp.callback_query(AdminLimitsState.choosing_scope, F.data.startswith("limit_scope:"))
 async def admin_limits_pick_scope(call: CallbackQuery, state: FSMContext):
@@ -653,6 +879,7 @@ async def admin_limits_pick_scope(call: CallbackQuery, state: FSMContext):
         await state.set_state(AdminLimitsState.choosing_role)
     await call.answer()
 
+
 @dp.callback_query(AdminLimitsState.choosing_slot, F.data.startswith("limit_slot:"))
 async def admin_limits_pick_slot(call: CallbackQuery, state: FSMContext):
     slot = call.data.split(":",1)[1]
@@ -665,6 +892,7 @@ async def admin_limits_pick_slot(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminLimitsState.choosing_role)
     await call.answer()
 
+
 @dp.callback_query(AdminLimitsState.choosing_role, F.data.startswith("limit_role:"))
 async def admin_limits_pick_role(call: CallbackQuery, state: FSMContext):
     role = call.data.split(":",1)[1]
@@ -674,6 +902,7 @@ async def admin_limits_pick_role(call: CallbackQuery, state: FSMContext):
     await call.message.answer("Можно отменить ввод:", reply_markup=cancel_kb())
     await state.set_state(AdminLimitsState.waiting_for_count)
     await call.answer()
+
 
 @dp.message(AdminLimitsState.waiting_for_count)
 async def admin_limits_set_count(message: types.Message, state: FSMContext):
@@ -712,6 +941,7 @@ async def admin_limits_set_count(message: types.Message, state: FSMContext):
 
     await message.answer(msg, reply_markup=menu_keyboard())
     await state.clear()
+
 
 # --- Limits view ---
 @dp.callback_query(F.data == "admin_limits_view")
@@ -776,6 +1006,7 @@ async def admin_limits_view(call: CallbackQuery, state: FSMContext):
     await call.message.answer("Готово.", reply_markup=kb.as_markup())
     await call.answer()
 
+
 @dp.callback_query(F.data == "admin_back")
 async def admin_back(call: CallbackQuery, state: FSMContext):
     me = supabase.table("users").select("id,team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
@@ -786,11 +1017,13 @@ async def admin_back(call: CallbackQuery, state: FSMContext):
     kb.button(text="📈 Лимиты (создать/изменить)", callback_data="admin_limits")
     kb.button(text="👀 Лимиты недели (просмотр)", callback_data="admin_limits_view")
     kb.button(text="🔁 Скопировать лимиты → след. неделя", callback_data="admin_limits_copy_next")
+    kb.button(text="📥 Скачать Excel", callback_data="admin_download_excel")
     kb.button(text="👤 Участники", callback_data="admin_members")
     kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
     kb.adjust(1)
     await call.message.edit_text("Админ-панель:", reply_markup=kb.as_markup())
     await call.answer()
+
 
 # --- Limits copy to next week ---
 @dp.callback_query(F.data == "admin_limits_copy_next")
@@ -845,6 +1078,7 @@ async def admin_limits_copy_next(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
+
 # --- Reset invite code ---
 @dp.callback_query(F.data == "admin_reset_invite")
 async def admin_reset_invite(call: CallbackQuery, state: FSMContext):
@@ -857,7 +1091,9 @@ async def admin_reset_invite(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(f"♻️ Новый инвайт-код: <code>{new_code}</code>", parse_mode="HTML")
     await call.answer()
 
+
 # --- Members: list / card / actions ---
+
 def _member_badges(u: dict) -> str:
     badges = []
     if u.get("is_owner"): badges.append("👑")
@@ -865,11 +1101,13 @@ def _member_badges(u: dict) -> str:
     badges.append("🟢" if u.get("is_active", True) else "🔴")
     return "".join(badges)
 
+
 def _paginate(items, page, size):
     total = len(items)
     start = page * size
     end = start + size
     return items[start:end], total
+
 
 @dp.callback_query(F.data == "admin_members")
 async def admin_members_start(call: CallbackQuery, state: FSMContext):
@@ -885,6 +1123,7 @@ async def admin_members_start(call: CallbackQuery, state: FSMContext):
     await _render_members_page(call.message, members, page=0)
     await state.set_state(AdminMembersState.browsing)
     await call.answer()
+
 
 async def _render_members_page(msg: types.Message, members: list, page: int):
     page_items, total = _paginate(members, page, PAGE_SIZE)
@@ -907,6 +1146,7 @@ async def _render_members_page(msg: types.Message, members: list, page: int):
     if has_prev or has_next:
         await msg.answer("Навигация:", reply_markup=nav.as_markup())
 
+
 @dp.callback_query(AdminMembersState.browsing, F.data.startswith("members_page:"))
 async def members_page_nav(call: CallbackQuery, state: FSMContext):
     page = int(call.data.split(":")[1])
@@ -914,6 +1154,7 @@ async def members_page_nav(call: CallbackQuery, state: FSMContext):
     members = data.get("members_cache", [])
     await _render_members_page(call.message, members, page)
     await call.answer()
+
 
 @dp.callback_query(F.data.startswith("member_open:"))
 async def member_open(call: CallbackQuery, state: FSMContext):
@@ -963,6 +1204,7 @@ async def member_open(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminMembersState.member_card)
     await call.answer()
 
+
 @dp.callback_query(F.data.startswith("member_setrole:"))
 async def member_setrole(call: CallbackQuery, state: FSMContext):
     _, user_id, role = call.data.split(":")
@@ -973,6 +1215,7 @@ async def member_setrole(call: CallbackQuery, state: FSMContext):
     await call.answer("Роль обновлена")
     # перерисуем карточку
     await member_open(call, state)
+
 
 @dp.callback_query(F.data.startswith("member_admin_toggle:"))
 async def member_admin_toggle(call: CallbackQuery, state: FSMContext):
@@ -989,6 +1232,7 @@ async def member_admin_toggle(call: CallbackQuery, state: FSMContext):
     supabase.table("users").update({"is_admin": not u.get("is_admin", False)}).eq("id", user_id).execute()
     await call.answer("Готово")
     await member_open(call, state)
+
 
 @dp.callback_query(F.data.startswith("member_toggle_active:"))
 async def member_toggle_active(call: CallbackQuery, state: FSMContext):
@@ -1007,6 +1251,7 @@ async def member_toggle_active(call: CallbackQuery, state: FSMContext):
     await call.answer("Статус изменён")
     await member_open(call, state)
 
+
 @dp.callback_query(F.data.startswith("member_remove:"))
 async def member_remove(call: CallbackQuery, state: FSMContext):
     user_id = call.data.split(":")[1]
@@ -1020,12 +1265,39 @@ async def member_remove(call: CallbackQuery, state: FSMContext):
     await call.answer("Пользователь удалён из команды")
     await admin_members_start(call, state)
 
+
+# --- EXPORT BUTTON HANDLER ---
+@dp.callback_query(F.data == "admin_download_excel")
+async def admin_download_excel(call: CallbackQuery, state: FSMContext):
+    me = supabase.table("users").select("team_id,is_admin,is_owner").eq("telegram_id", call.from_user.id).execute().data
+    if not me or not ensure_admin(me[0]):
+        await call.answer("Нет доступа", show_alert=True); return
+
+    team_id = me[0]["team_id"]
+    # Проверим наличие активной недели
+    if not get_active_week(team_id):
+        await call.answer("Нет активной недели", show_alert=True); return
+
+    await call.message.answer("Готовлю файл…")
+    try:
+        filename, bio = export_schedule_excel_for_team(team_id)
+    except Exception as e:
+        await call.message.answer(f"Ошибка экспорта: {e}")
+        await call.answer()
+        return
+
+    document = types.BufferedInputFile(bio.getvalue(), filename=filename)
+    await call.message.answer_document(document)
+    await call.answer()
+
+
 # ---------------- GLOBAL CANCEL ----------------
 # Ловит "Отмена", "❌ Отмена" и т.п. в ЛЮБОМ состоянии (дополнительно к ранней проверке в state-хэндлерах)
 @dp.message(F.text.regexp(r"(?i)отмена"))
 async def cancel_text(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
