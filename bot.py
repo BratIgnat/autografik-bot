@@ -1,16 +1,26 @@
 import os
+from datetime import datetime, timedelta
+from uuid import uuid4
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from supabase import create_client, Client
-from datetime import datetime, timedelta
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    FSInputFile,
+    CallbackQuery,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from aiogram.types import FSInputFile, CallbackQuery
-from uuid import uuid4
-import matplotlib.pyplot as plt
+from supabase import create_client, Client
+
+# --- matplotlib для сервера без дисплея ---
+import matplotlib
+matplotlib.use("Agg")            # важно для ВМ
+import matplotlib.pyplot as plt  # после выбора бэкенда
 
 # ---------------- ENV & INIT ----------------
 load_dotenv()
@@ -69,7 +79,7 @@ ROLE_CODES = [
     ("Админы",     "admin"),
     ("Стажёры",    "trainee"),
 ]
-STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-23:00", "17:00-23:00", "хост", "бар"]
+STD_SLOTS = ["09:30-23:00", "10:00-23:00", "11:00-23:00", "12:00-23:00", "13:00-23:00", "17:00-23:00"]
 NO_SHIFT = {"-", "вых", "выходной"}  # значения, не считающиеся сменой
 PAGE_SIZE = 10
 
@@ -79,6 +89,10 @@ def ensure_admin(user_row: dict) -> bool:
 def now_iso_z() -> str:
     # UTC ISO8601 с Z — нормально пишется в timestamptz
     return datetime.utcnow().isoformat() + "Z"
+
+def is_cancel(text: str) -> bool:
+    """Возвращает True, если сообщение похоже на 'Отмена' (с эмодзи/пробелами/регистром)."""
+    return bool(text) and ("отмена" in text.casefold())
 
 # ---------------- KEYBOARDS ----------------
 def menu_keyboard():
@@ -96,12 +110,11 @@ def start_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# Универсальная inline-«Отмена»: всегда возвращает в пользовательское меню
-def cancel_markup() -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="❌ Отмена", callback_data="cancel")
-    kb.adjust(1)
-    return kb.as_markup()
+def cancel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True
+    )
 
 # ---------------- DATA HELPERS ----------------
 def get_active_week(team_id):
@@ -190,33 +203,6 @@ def make_schedule_image(users, week_days, shifts):
     plt.close(fig)
     return "schedule.png"
 
-# ---------------- CANCEL HANDLERS ----------------
-@dp.callback_query(F.data == "cancel")
-async def cancel_any(call: CallbackQuery, state: FSMContext):
-    """Всегда сбрасывает состояние и возвращает базовое меню пользователя."""
-    await state.clear()
-    me = supabase.table("users").select("team_id,is_active").eq("telegram_id", call.from_user.id).execute().data
-    try:
-        await call.message.edit_text("Отменено.", reply_markup=None)
-    except Exception:
-        await call.message.answer("Отменено.")
-    if me and me[0].get("team_id") and me[0].get("is_active", True):
-        await call.message.answer("Главное меню:", reply_markup=menu_keyboard())
-    else:
-        await call.message.answer("Ты не в команде. Создай команду или вступи по коду:",
-                                  reply_markup=start_keyboard())
-    await call.answer()
-
-@dp.message(F.text.casefold() == "отмена")
-async def cancel_text(message: types.Message, state: FSMContext):
-    await state.clear()
-    me = supabase.table("users").select("team_id,is_active").eq("telegram_id", message.from_user.id).execute().data
-    if me and me[0].get("team_id") and me[0].get("is_active", True):
-        await message.answer("Главное меню:", reply_markup=menu_keyboard())
-    else:
-        await message.answer("Ты не в команде. Создай команду или вступи по коду:",
-                             reply_markup=start_keyboard())
-
 # ---------------- COMMANDS ----------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -244,11 +230,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "➕ Создать команду")
 async def btn_create_team(message: types.Message, state: FSMContext):
-    await message.answer("Введи название для своей команды (одной строкой):", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Введи название для своей команды (одной строкой):", reply_markup=cancel_kb())
     await state.set_state(CreateTeamState.waiting_for_team_name)
 
 @dp.message(CreateTeamState.waiting_for_team_name)
 async def create_team_name(message: types.Message, state: FSMContext):
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     name = message.text.strip()
     invite_code = str(uuid4()).split('-')[0].upper()
     team_id = str(uuid4())
@@ -272,11 +263,16 @@ async def create_team_name(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "🔑 Вступить по коду")
 async def btn_join_team(message: types.Message, state: FSMContext):
-    await message.answer("Введи код приглашения (invite_code) команды:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Введи код приглашения (invite_code) команды:", reply_markup=cancel_kb())
     await state.set_state(JoinTeamState.waiting_for_invite)
 
 @dp.message(JoinTeamState.waiting_for_invite)
 async def join_team_code(message: types.Message, state: FSMContext):
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     code = message.text.strip().upper()
     team = supabase.table('teams').select('id', 'name').eq('invite_code', code).execute().data
     if not team:
@@ -356,10 +352,10 @@ async def myslot_start(message: types.Message, state: FSMContext):
         return
     week_days = get_week_dates(week["start_date"], week["end_date"])
 
-    kb = [[KeyboardButton(text=f"{day['weekday']} {day['date']}")] for day in week_days]
-    kb.append([KeyboardButton(text="❌ Отмена")])        # ← cancel (reply)
-    await message.answer("Выбери день для смены:",
-                         reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    # Клавиатура с датами + Отмена
+    kb_rows = [[KeyboardButton(text=f"{day['weekday']} {day['date']}")] for day in week_days]
+    kb_rows.append([KeyboardButton(text="❌ Отмена")])
+    await message.answer("Выбери день для смены:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_rows, resize_keyboard=True))
     await state.set_state(SlotState.waiting_for_date)
     await state.update_data(week_days=week_days, team_id=team_id)
 
@@ -383,9 +379,7 @@ async def btn_give_role(message: types.Message, state: FSMContext):
             text=f"{member['name']} ({member.get('role', '')})",
             callback_data=f"setrole_{member['id']}"
         )
-    keyboard.adjust(1)
     await message.answer("Выберите сотрудника для назначения роли:", reply_markup=keyboard.as_markup())
-    await message.answer(" ", reply_markup=cancel_markup())   # ← cancel
 
 @dp.callback_query(F.data.startswith("setrole_"))
 async def callback_choose_role(call: CallbackQuery, state: FSMContext):
@@ -401,10 +395,12 @@ async def callback_choose_role(call: CallbackQuery, state: FSMContext):
     ]
     keyboard = InlineKeyboardBuilder()
     for title, code in roles:
-        keyboard.button(text=title, callback_data=f"setroleto_{code}")
+        keyboard.button(
+            text=title,
+            callback_data=f"setroleto_{code}"
+        )
     keyboard.adjust(2)
     await call.message.edit_text("Выберите новую роль для сотрудника:", reply_markup=keyboard.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await call.answer()
 
 @dp.callback_query(F.data.startswith("setroleto_"))
@@ -423,34 +419,36 @@ async def callback_set_role(call: CallbackQuery, state: FSMContext):
 # ---------------- SLOT PICKING ----------------
 @dp.message(SlotState.waiting_for_date)
 async def slot_choose_day(message: types.Message, state: FSMContext):
+    # ранняя отмена
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     data = await state.get_data()
     week_days = data.get("week_days")
     selected = message.text
+
     day = next((d for d in week_days if f"{d['weekday']} {d['date']}" == selected), None)
     if not day:
         await message.answer("Неверная дата. Попробуй ещё раз.")
         return
 
-    slots = [
-        KeyboardButton(text="09:30-23:00"),
-        KeyboardButton(text="10:00-23:00"),
-        KeyboardButton(text="11:00-23:00"),
-        KeyboardButton(text="12:00-23:00"),
-        KeyboardButton(text="13:00-23:00"),
-        KeyboardButton(text="вых"),
-        KeyboardButton(text="17:00-23:00"),
-        KeyboardButton(text="хост"),
-        KeyboardButton(text="бар")
-    ]
-    kb = [[s] for s in slots]
-    kb.append([KeyboardButton(text="❌ Отмена")])    # ← cancel (reply)
+    # клавиатура слотов + отмена
+    slots = [KeyboardButton(text=s) for s in STD_SLOTS] + [KeyboardButton(text="вых")]
+    kb_rows = [[KeyboardButton(text=s)] for s in STD_SLOTS] + [[KeyboardButton(text="вых")], [KeyboardButton(text="❌ Отмена")]]
     await state.update_data(selected_date=day["date_iso"])
-    await message.answer("Выбери смену:",
-                         reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    await message.answer("Выбери смену:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_rows, resize_keyboard=True))
     await state.set_state(SlotState.waiting_for_slot)
 
 @dp.message(SlotState.waiting_for_slot)
 async def slot_choose_slot(message: types.Message, state: FSMContext):
+    # ранняя отмена
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     data = await state.get_data()
     slot = (message.text or "").strip()
 
@@ -555,7 +553,6 @@ async def admin_entry(message: types.Message, state: FSMContext):
     kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
     kb.adjust(1)
     await message.answer("Админ-панель:", reply_markup=kb.as_markup())
-    await message.answer(" ", reply_markup=cancel_markup())   # ← cancel
 
 # --- Active Week flow ---
 @dp.callback_query(F.data == "admin_week")
@@ -566,12 +563,19 @@ async def admin_week_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(team_id=me[0]["team_id"])
     txt = ("Введи дату ПОНЕДЕЛЬНИКА в формате YYYY-MM-DD.\n"
            "Я поставлю конец недели = +6 дней и сделаю её активной.")
-    await call.message.edit_text(txt, reply_markup=cancel_markup())  # ← cancel
+    await call.message.edit_text(txt)
+    # показать кнопку Отмена
+    await call.message.answer("Можно отменить ввод:", reply_markup=cancel_kb())
     await state.set_state(AdminWeekState.waiting_for_monday)
     await call.answer()
 
 @dp.message(AdminWeekState.waiting_for_monday)
 async def admin_week_set(message: types.Message, state: FSMContext):
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     try:
         dt = datetime.strptime(message.text.strip(), "%Y-%m-%d").date()
     except Exception:
@@ -603,8 +607,7 @@ async def admin_limits_start(call: CallbackQuery, state: FSMContext):
     team_id = me[0]["team_id"]
     week = get_active_week(team_id)
     if not week:
-        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).",
-                                     reply_markup=cancel_markup())  # ← cancel
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
         await call.answer(); return
 
     days = get_week_dates(week["start_date"], week["end_date"])
@@ -614,7 +617,6 @@ async def admin_limits_start(call: CallbackQuery, state: FSMContext):
     kb.adjust(3)
     await state.update_data(team_id=team_id)
     await call.message.edit_text("Выбери день для лимита:", reply_markup=kb.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await state.set_state(AdminLimitsState.choosing_date)
     await call.answer()
 
@@ -627,7 +629,6 @@ async def admin_limits_pick_date(call: CallbackQuery, state: FSMContext):
     kb.button(text="Лимит на СЛОТ", callback_data="limit_scope:slot")
     kb.adjust(1)
     await call.message.edit_text(f"Дата: {date_iso}\nВыбери тип лимита:", reply_markup=kb.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await state.set_state(AdminLimitsState.choosing_scope)
     await call.answer()
 
@@ -642,15 +643,14 @@ async def admin_limits_pick_scope(call: CallbackQuery, state: FSMContext):
             kb.button(text=s, callback_data=f"limit_slot:{s}")
         kb.adjust(3)
         await call.message.edit_text("Выбери слот:", reply_markup=kb.as_markup())
+        await state.set_state(AdminLimitsState.choosing_slot)
     else:
         kb = InlineKeyboardBuilder()
         for title, code in ROLE_CODES:
             kb.button(text=title, callback_data=f"limit_role:{code}")
         kb.adjust(2)
         await call.message.edit_text("Выбери роль:", reply_markup=kb.as_markup())
-
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
-    await state.set_state(AdminLimitsState.choosing_slot if scope == "slot" else AdminLimitsState.choosing_role)
+        await state.set_state(AdminLimitsState.choosing_role)
     await call.answer()
 
 @dp.callback_query(AdminLimitsState.choosing_slot, F.data.startswith("limit_slot:"))
@@ -662,7 +662,6 @@ async def admin_limits_pick_slot(call: CallbackQuery, state: FSMContext):
         kb.button(text=title, callback_data=f"limit_role:{code}")
     kb.adjust(2)
     await call.message.edit_text(f"Слот: {slot}\nТеперь выбери роль:", reply_markup=kb.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await state.set_state(AdminLimitsState.choosing_role)
     await call.answer()
 
@@ -670,13 +669,19 @@ async def admin_limits_pick_slot(call: CallbackQuery, state: FSMContext):
 async def admin_limits_pick_role(call: CallbackQuery, state: FSMContext):
     role = call.data.split(":",1)[1]
     await state.update_data(role=role)
-    await call.message.edit_text("Введи максимальное количество (целое число ≥ 0):",
-                                 reply_markup=cancel_markup())  # ← cancel
+    # просим число + показываем кнопку отмены
+    await call.message.edit_text("Введи максимальное количество (целое число ≥ 0):")
+    await call.message.answer("Можно отменить ввод:", reply_markup=cancel_kb())
     await state.set_state(AdminLimitsState.waiting_for_count)
     await call.answer()
 
 @dp.message(AdminLimitsState.waiting_for_count)
 async def admin_limits_set_count(message: types.Message, state: FSMContext):
+    if is_cancel(message.text):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
+        return
+
     try:
         n = int(message.text.strip())
         if n < 0:
@@ -718,8 +723,7 @@ async def admin_limits_view(call: CallbackQuery, state: FSMContext):
 
     week = get_active_week(team_id)
     if not week:
-        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).",
-                                     reply_markup=cancel_markup())
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
         await call.answer(); return
 
     days = get_week_dates(week["start_date"], week["end_date"])
@@ -739,13 +743,14 @@ async def admin_limits_view(call: CallbackQuery, state: FSMContext):
         parts = []
         for role in sorted(by_role.keys()):
             rec = by_role[role]
+            chunk = f"{role}: "
             sub = []
             if rec["day"] is not None:
                 sub.append(f"день={rec['day']}")
             if rec["slots"]:
                 slot_str = ", ".join(f"{s}={cnt}" for s, cnt in sorted(rec["slots"].items()))
                 sub.append(slot_str)
-            chunk = f"{role}: " + ("; ".join(sub) if sub else "—")
+            chunk += "; ".join(sub) if sub else "—"
             parts.append(chunk)
         return " | ".join(parts)
 
@@ -768,9 +773,7 @@ async def admin_limits_view(call: CallbackQuery, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад в админ-меню", callback_data="admin_back")
-    kb.adjust(1)
     await call.message.answer("Готово.", reply_markup=kb.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await call.answer()
 
 @dp.callback_query(F.data == "admin_back")
@@ -787,7 +790,6 @@ async def admin_back(call: CallbackQuery, state: FSMContext):
     kb.button(text="♻️ Сбросить инвайт-код", callback_data="admin_reset_invite")
     kb.adjust(1)
     await call.message.edit_text("Админ-панель:", reply_markup=kb.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await call.answer()
 
 # --- Limits copy to next week ---
@@ -800,8 +802,7 @@ async def admin_limits_copy_next(call: CallbackQuery, state: FSMContext):
 
     week = get_active_week(team_id)
     if not week:
-        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).",
-                                     reply_markup=cancel_markup())
+        await call.message.edit_text("Сначала создай активную неделю (меню → 📆 Активная неделя).")
         await call.answer(); return
 
     start = datetime.strptime(week["start_date"], "%Y-%m-%d").date()
@@ -811,8 +812,7 @@ async def admin_limits_copy_next(call: CallbackQuery, state: FSMContext):
         .eq("team_id", team_id).gte("date", start.isoformat()).lte("date", end.isoformat()).execute().data
 
     if not rows:
-        await call.message.edit_text("На активной неделе нет лимитов для копирования.",
-                                     reply_markup=cancel_markup())
+        await call.message.edit_text("На активной неделе нет лимитов для копирования.")
         await call.answer(); return
 
     inserted = 0
@@ -843,7 +843,6 @@ async def admin_limits_copy_next(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"✅ Скопировано лимитов на следующую неделю: добавлено {inserted}, обновлено {updated}."
     )
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await call.answer()
 
 # --- Reset invite code ---
@@ -856,7 +855,6 @@ async def admin_reset_invite(call: CallbackQuery, state: FSMContext):
     new_code = str(uuid4()).split("-")[0].upper()
     supabase.table("teams").update({"invite_code": new_code}).eq("id", team_id).execute()
     await call.message.edit_text(f"♻️ Новый инвайт-код: <code>{new_code}</code>", parse_mode="HTML")
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await call.answer()
 
 # --- Members: list / card / actions ---
@@ -885,7 +883,6 @@ async def admin_members_start(call: CallbackQuery, state: FSMContext):
 
     await state.update_data(members_cache=members)  # кэш на время просмотра
     await _render_members_page(call.message, members, page=0)
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await state.set_state(AdminMembersState.browsing)
     await call.answer()
 
@@ -895,19 +892,19 @@ async def _render_members_page(msg: types.Message, members: list, page: int):
     for u in page_items:
         label = f"{_member_badges(u)} {u['name']} ({u.get('role') or '—'})"
         kb.button(text=label[:64], callback_data=f"member_open:{u['id']}")
-    kb.adjust(1)
-
     # навигация
     nav = InlineKeyboardBuilder()
-    if page > 0:
+    has_prev = page > 0
+    has_next = (page + 1) * PAGE_SIZE < total
+    if has_prev:
         nav.button(text="⬅️ Назад", callback_data=f"members_page:{page-1}")
-    if (page + 1) * PAGE_SIZE < total:
+    if has_next:
         nav.button(text="Вперёд ➡️", callback_data=f"members_page:{page+1}")
     nav.adjust(2)
-
+    kb.adjust(1)
     text = f"👤 Участники (стр. {page+1})"
     await msg.edit_text(text, reply_markup=kb.as_markup())
-    if nav.buttons:
+    if has_prev or has_next:
         await msg.answer("Навигация:", reply_markup=nav.as_markup())
 
 @dp.callback_query(AdminMembersState.browsing, F.data.startswith("members_page:"))
@@ -940,11 +937,13 @@ async def member_open(call: CallbackQuery, state: FSMContext):
     )
 
     kb = InlineKeyboardBuilder()
+    # смена роли
     for title, code in ROLE_CODES:
         kb.button(text=title, callback_data=f"member_setrole:{u['id']}:{code}")
     kb.adjust(3)
 
     actions = InlineKeyboardBuilder()
+    # нельзя понижать владельца по кнопке "админ"
     if not u.get("is_owner"):
         actions.button(
             text=("Снять админа" if u.get("is_admin") else "Сделать админом"),
@@ -961,7 +960,6 @@ async def member_open(call: CallbackQuery, state: FSMContext):
 
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
     await call.message.answer("Действия:", reply_markup=actions.as_markup())
-    await call.message.answer(" ", reply_markup=cancel_markup())  # ← cancel
     await state.set_state(AdminMembersState.member_card)
     await call.answer()
 
@@ -973,6 +971,7 @@ async def member_setrole(call: CallbackQuery, state: FSMContext):
         await call.answer("Нет доступа", show_alert=True); return
     supabase.table("users").update({"role": role}).eq("id", user_id).eq("team_id", me["team_id"]).execute()
     await call.answer("Роль обновлена")
+    # перерисуем карточку
     await member_open(call, state)
 
 @dp.callback_query(F.data.startswith("member_admin_toggle:"))
@@ -1016,9 +1015,17 @@ async def member_remove(call: CallbackQuery, state: FSMContext):
         await call.answer("Нет доступа", show_alert=True); return
     if me["id"] == user_id:
         await call.answer("Нельзя удалить самого себя.", show_alert=True); return
+    # Жёсткое удаление из команды: team_id=null, снимаем админа и деактивируем
     supabase.table("users").update({"team_id": None, "is_admin": False, "is_active": False}).eq("id", user_id).eq("team_id", me["team_id"]).execute()
     await call.answer("Пользователь удалён из команды")
     await admin_members_start(call, state)
+
+# ---------------- GLOBAL CANCEL ----------------
+# Ловит "Отмена", "❌ Отмена" и т.п. в ЛЮБОМ состоянии (дополнительно к ранней проверке в state-хэндлерах)
+@dp.message(F.text.regexp(r"(?i)отмена"))
+async def cancel_text(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Отменено.", reply_markup=menu_keyboard())
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
