@@ -154,7 +154,6 @@ def export_schedule_excel(supabase, tz_name="Europe/Moscow", week_monday: dateti
         # Один лист "График"
         sheet_name = "График"
         start_row = 1
-        limits_rows = []
 
         # Сначала — сводка по лимитам вверху
         # Структура: День недели | Роль | Лимит
